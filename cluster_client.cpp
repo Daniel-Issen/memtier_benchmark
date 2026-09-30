@@ -2819,6 +2819,13 @@ void cluster_client::handle_rate_limit_refill(unsigned int conn_id)
     wake_mget_producers(conn_id);
 }
 
+void cluster_client::handle_connection_disconnect(unsigned int conn_id)
+{
+    // A disconnected destination will not answer its pending requests. Let
+    // their producers retry routing to another live replica or the primary.
+    wake_mget_producers(conn_id);
+}
+
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {

@@ -596,6 +596,8 @@ void shard_connection::disconnect()
     if (m_protocol != NULL) {
         m_protocol->reset_state();
     }
+    // Notify only after routing can observe this connection as disconnected.
+    m_conns_manager->handle_connection_disconnect(m_id);
 }
 
 void shard_connection::set_address_port(const char *address, const char *port)

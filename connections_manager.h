@@ -54,6 +54,7 @@ public:
 
     // Routed requests can be waiting on another connection's rate budget.
     virtual void handle_rate_limit_refill(unsigned int) {}
+    virtual void handle_connection_disconnect(unsigned int) {}
 
     virtual int connect(void) = 0;
     virtual void disconnect(void) = 0;

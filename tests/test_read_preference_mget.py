@@ -21,7 +21,9 @@ test_read_preference_mget
 
 import json
 import os
+import subprocess
 import tempfile
+import time
 
 from include import (
     add_required_env_arguments,
@@ -368,6 +370,75 @@ def test_read_preference_mget_destination_rate_limit(env):
         limit = connections * (1 + rate * (runtime["Total duration"] / 1000.0 + 0.25))
         env.assertTrue(count <= limit, message="{} MGETs exceeded rate bound {}".format(count, limit))
         env.assertGreater(count, clients * rate)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_read_preference_mget_destination_disconnect_wakes_producer(env):
+    """A dropped replica must release its MGET producer before reconnecting."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    master_conns = env.getOSSMasterNodesConnectionList()
+    duration = 6
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--ratio=0:10", "--multi-key-get=10", "--pipeline=1",
+            # One key confines production to one primary with no local I/O.
+            "--key-minimum=1", "--key-maximum=1",
+            "--read-preference=secondaryPreferred", "--reconnect-on-error",
+            # Primary progress must occur while replica reconnect is pending.
+            "--reconnect-backoff-factor=30",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=duration)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    run_config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    initial_primary = _sum_mget_calls(master_conns)
+    initial_replica = _sum_mget_calls(replica_conns)
+    failed = env.getNumberOfFailedAssertion()
+
+    try:
+        with open(os.path.join(run_config.results_dir, "mb.process.stdout"), "w") as stdout_f, \
+                open(os.path.join(run_config.results_dir, "mb.stderr"), "w") as stderr_f:
+            proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f)
+            try:
+                deadline = time.monotonic() + duration / 2
+                while _sum_mget_calls(replica_conns) - initial_replica < 100:
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        raise AssertionError("replica MGET workload did not become active before disconnect")
+                    time.sleep(0.02)
+                env.assertEqual(_sum_mget_calls(master_conns), initial_primary)
+                killed = sum(conn.execute_command("CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes")
+                             for conn in replica_conns)
+                env.assertGreater(killed, 0)
+                deadline = time.monotonic() + 3
+                while _sum_mget_calls(master_conns) == initial_primary:
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        raise AssertionError("MGET producer stayed parked after replica disconnect")
+                    time.sleep(0.02)
+                return_code = proc.wait(timeout=3 * duration)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=10)
+        env.assertEqual(return_code, 0)
+        stats = _read_stats(run_config)
+        env.assertGreater(stats["Gets"]["Count"], 100)
+        env.assertEqual(stats["Totals"]["Count"], stats["Gets"]["Count"])
+        env.assertGreater(stats["Totals"]["Connection Errors"], 0)
+        env.assertEqual(stats["Runtime"]["Time unit"], "MILLISECONDS")
+        env.assertGreaterEqual(stats["Runtime"]["Total duration"], duration * 1000)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
