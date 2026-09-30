@@ -1512,7 +1512,13 @@ void shard_connection::handle_timer_event(void)
         return;
     }
 
+    m_conns_manager->handle_rate_limit_refill(m_id);
     fill_pipeline();
+}
+
+bool shard_connection::has_request_rate_budget() const
+{
+    return !m_config->request_rate || m_request_per_cur_interval > 0;
 }
 
 void shard_connection::schedule_fill(void)

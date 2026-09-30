@@ -321,3 +321,53 @@ def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
+
+
+def test_read_preference_mget_destination_rate_limit(env):
+    """Response wakeups must not bypass the destination replica's rate tokens."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    clients = 2
+    rate = 50
+    duration = 2
+    extra_args = [
+        "--ratio=0:{}".format(_MGET_BATCH),
+        "--multi-key-get={}".format(_MGET_BATCH),
+        "--pipeline=4",
+        "--key-minimum={}".format(_KEY_MIN),
+        "--key-maximum={}".format(_KEY_MAX),
+        "--read-preference=secondary",
+        "--rate-limiting={}".format(rate),
+        "--test-time={}".format(duration),
+    ]
+    ok, run_config = _run_mget_workload(
+        env, extra_args, threads=1, clients=clients, requests=None, timeout=20
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="rate-limited replica MGET did not complete")
+        stats = _read_stats(run_config)
+        runtime = stats["Runtime"]
+        env.assertEqual(runtime["Time unit"], "MILLISECONDS")
+        env.assertGreaterEqual(runtime["Total duration"], duration * 1000)
+        count = stats["Totals"]["Count"]
+        env.assertEqual(stats["Gets"]["Count"], count)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
+        # The rate applies per physical destination connection. Allow the
+        # initial token plus 250 ms of setup/drain timing per connection,
+        # but neither a pipeline-sized burst every tick nor unrestricted
+        # response-driven production. Also require multiple refill cycles.
+        connections = clients * len(replica_conns)
+        limit = connections * (1 + rate * (runtime["Total duration"] / 1000.0 + 0.25))
+        env.assertTrue(count <= limit, message="{} MGETs exceeded rate bound {}".format(count, limit))
+        env.assertGreater(count, clients * rate)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)

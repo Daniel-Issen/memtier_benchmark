@@ -2396,8 +2396,12 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // MGET when the destination is at its per-connection pipeline cap.
     // schedule_fill() wakes the destination so its own fill_pipeline can
     // drain and re-check; the next outer create_request tick rebalances.
-    if (routed != conn_id && (unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline) {
-        m_connections[routed]->schedule_fill();
+    if (routed != conn_id && ((unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline ||
+                              !m_connections[routed]->has_request_rate_budget())) {
+        // Routed sends consume the destination's tokens, not the producer's.
+        // When that budget is exhausted, only its refill timer can release
+        // this hold; scheduling it immediately would just retry without tokens.
+        if (m_connections[routed]->has_request_rate_budget()) m_connections[routed]->schedule_fill();
         // Bump the strict-no-route counter on pipeline-cap defer too. In
         // pure-MGET workloads (--ratio 0:N --multi-key-get) with a
         // saturated destination replica the producer's pipeline never
@@ -2808,6 +2812,11 @@ void cluster_client::wake_mget_producers(unsigned int conn_id)
         if (*i < m_connections.size()) m_connections[*i]->schedule_fill();
     }
     producers.clear(); // Retain capacity: no allocation on steady-state wakeups.
+}
+
+void cluster_client::handle_rate_limit_refill(unsigned int conn_id)
+{
+    wake_mget_producers(conn_id);
 }
 
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,

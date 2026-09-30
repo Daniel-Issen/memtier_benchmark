@@ -168,6 +168,7 @@ public:
 
     void set_cluster_slots() { m_cluster_slots = setup_none; }
     void schedule_fill(void);
+    bool has_request_rate_budget() const;
 
     enum setup_state get_cluster_slots_state() { return m_cluster_slots; }
 
