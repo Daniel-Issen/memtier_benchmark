@@ -3068,47 +3068,49 @@ static void *cg_thread_start(void *t)
     try {
         thread->m_cg->run();
 
-        // A worker has one legitimate end: each client reached its stop
-        // condition (--test-time elapsed / --requests done) and set its end
-        // time. Connection errors that --reconnect-on-error recovered from do
-        // not change that, so they are not checked here. A client that has no
-        // end time was cut off: its connection died and was not recovered
-        // (--reconnect-on-error off, or its attempts exhausted) and the event
-        // loop was broken. This worker then stopped short of the window it was
-        // asked to measure. Report it; run_benchmark() fails the run after the
-        // join. The worker is deliberately NOT restarted -- see
-        // cg_thread::m_failed.
+        // A completed client stamps its end time when its stop condition is
+        // reached. Recovered connection errors do not invalidate that window.
+        // An unended client means incomplete work, but does not identify the
+        // cause: connection loss and an event loop with no pending events can
+        // both leave clients unfinished. Fail the run without restarting it.
         //
         // Ctrl+C and the connection-stage supervisor end the loop through
         // client_group::interrupt(), which stamps end times from the main
         // thread; neither is a worker failure (the latter exits 2 itself).
-        unsigned int unended = thread->m_cg->count_unended_clients();
-        if (unended > 0 && !g_interrupted && !g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            benchmark_error_log("Thread %u: %u client(s) stopped early on unrecovered connection errors.\n",
-                                thread->m_thread_id, unended);
-            thread->m_failed = true;
-            // Stamp the cut-off clients' end time now, as interrupt() does, so
-            // the recorded duration is the time actually spent.
-            thread->m_cg->finalize_all_clients();
+        if (!g_interrupted && !g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            unsigned int unended = thread->m_cg->count_unended_clients();
+            if (unended > 0) {
+                benchmark_error_log("Thread %u: %u client(s) stopped before reaching their stop condition.\n",
+                                    thread->m_thread_id, unended);
+                thread->m_failed = true;
+            }
         }
-
-        cg_thread_capture_cpu_end(thread);
-        thread->m_finished = true;
     } catch (const std::exception &e) {
         benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
-        cg_thread_capture_cpu_end(thread);
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
             thread->m_failed = true;
         }
-        thread->m_finished = true;
     } catch (...) {
         benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
-        cg_thread_capture_cpu_end(thread);
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
             thread->m_failed = true;
         }
-        thread->m_finished = true;
     }
+
+    // Retain the measured window on every failure path, including exceptions:
+    // finalization stamps end times and commits each client's last partial bucket.
+    if (thread->m_failed) {
+        try {
+            thread->m_cg->finalize_all_clients();
+        } catch (...) {
+            // Finalization can allocate. If it fails too, do not merge or print
+            // unfinalized statistics, and do not throw across the pthread entry.
+            benchmark_error_log("Thread %u: unable to finalize statistics; aborting benchmark.\n", thread->m_thread_id);
+            exit(EXIT_FAILURE);
+        }
+    }
+    cg_thread_capture_cpu_end(thread);
+    thread->m_finished = true;
 
     return t;
 }

@@ -872,7 +872,7 @@ def test_F17_monotonicity_under_churn(env):
         return
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=5", "--prometheus-port=0"], rd
+        env, ["--test-time=5", "--prometheus-port=0", "--reconnect-on-error"], rd
     )
     stop = threading.Event()
 
@@ -908,7 +908,8 @@ def test_F17_monotonicity_under_churn(env):
             time.sleep(0.25)
         stop.set()
         kt.join(timeout=5)
-        proc.wait()
+        rc = proc.wait(timeout=20)
+        env.assertEqual(rc, 0, message="churn workload exited {}: {}".format(rc, _drain(err_path)))
         env.assertTrue(last_ce > 0, message="no connection errors observed under CLIENT KILL")
     finally:
         stop.set()

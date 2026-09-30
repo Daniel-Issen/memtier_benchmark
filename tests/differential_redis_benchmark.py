@@ -498,8 +498,8 @@ def test_diff_server_killed_mid_stream(redis_server):
         assert not mt_timed_out, (
             "memtier kept running after the server was killed; "
             f"stderr={mt_stderr!r}")
-        assert mt_proc.returncode != 0, (
-            "memtier exited 0 against a server killed mid-run")
+        assert mt_proc.returncode == 1, (
+            f"memtier should report an incomplete run with exit 1; got {mt_proc.returncode}")
 
     payload = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n" * 5000
     cli_proc = subprocess.run(

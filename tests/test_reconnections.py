@@ -1,3 +1,4 @@
+import json
 import tempfile
 import time
 import threading
@@ -293,7 +294,7 @@ def test_reconnect_unlimited_no_spurious_thread_restart(env):
     else branch and called event_base_loopbreak(), killing the benchmark
     thread. This produced the misleading log line:
 
-        Maximum reconnection attempts (0) exceeded for ..., triggering thread restart.
+        Maximum reconnection attempts (0) exceeded for ..., ending this thread.
 
     …even though the user had explicitly requested unlimited reconnects.
 
@@ -613,14 +614,14 @@ def test_reconnect_backoff_cap_60s(env):
 
 
 def _run_with_mid_run_client_kill(env, extra_args, test_time, kill_after):
-    """Run memtier with --test-time=test_time, CLIENT KILL every normal client
-    once, kill_after seconds in, and return (return_code, elapsed, stderr)."""
+    """Kill active workload clients once and retain their output and server counts."""
     import subprocess
 
     benchmark_specs = {
         "name": env.testName,
         "args": [
             "--pipeline=1",
+            "--rate-limiting=200",
             "--ratio=1:1",
             "--key-pattern=R:R",
             "--key-minimum=1",
@@ -639,26 +640,52 @@ def _run_with_mid_run_client_kill(env, extra_args, test_time, kill_after):
     ensure_clean_benchmark_folder(config.results_dir)
     benchmark = Benchmark.from_json(config, benchmark_specs)
     master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    conn = master_nodes_connections[0]  # Both callers skip cluster mode.
+    initial_client_ids = {client["id"] for client in conn.client_list()}
+
+    def command_count():
+        stats = conn.info("commandstats")
+        return sum(stats.get("cmdstat_" + command, {}).get("calls", 0) for command in ("get", "set"))
+
+    initial_commands = command_count()
 
     stderr_path = "{0}/mb.stderr".format(config.results_dir)
-    started = time.time()
+    started = time.monotonic()
     with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
         proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
-        time.sleep(kill_after)
-        for conn in master_nodes_connections:
-            conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
         try:
+            # Confirm all four clients have issued workload commands before
+            # injecting the disconnect, including on slower TLS/sanitizer cells.
+            ready_deadline = started + test_time / 2
+            while True:
+                workload_clients = [client for client in conn.client_list()
+                                    if client["id"] not in initial_client_ids and client["cmd"] in ("get", "set")]
+                if len(workload_clients) == 4:
+                    break
+                if proc.poll() is not None or time.monotonic() >= ready_deadline:
+                    raise AssertionError("four active workload clients were not ready before the kill")
+                time.sleep(0.02)
+            time.sleep(max(0, started + kill_after - time.monotonic()))
+            commands_before_kill = command_count() - initial_commands
+            killed = conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
+            env.assertGreaterEqual(killed, 4, message="the disconnect must reach all four workload clients")
+            env.assertGreater(commands_before_kill, 0, message="no workload ran before the disconnect")
             return_code = proc.wait(timeout=6 * test_time)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return_code = proc.wait(timeout=10)
-    elapsed = time.time() - started
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+    elapsed = time.monotonic() - started
+    server_commands = command_count() - initial_commands
 
     with open(stderr_path) as f:
         stderr_content = f.read()
+    with open("{0}/mb.json".format(config.results_dir)) as f:
+        results = json.load(f)["ALL STATS"]
     env.debugPrint("memtier exit code: {}, elapsed {:.1f}s".format(return_code, elapsed), True)
     env.debugPrint("STDERR:\n{}".format(stderr_content[:2000]), True)
-    return return_code, elapsed, stderr_content
+    env.assertGreater(results["Totals"]["Count"], 0)
+    return return_code, elapsed, stderr_content, results, server_commands
 
 
 def test_connection_kill_without_reconnect_fails_on_time(env):
@@ -672,14 +699,17 @@ def test_connection_kill_without_reconnect_fails_on_time(env):
     """
     env.skipOnCluster()
     test_time, kill_after = 8, 2
-    rc, elapsed, stderr_content = _run_with_mid_run_client_kill(env, [], test_time, kill_after)
+    rc, elapsed, stderr_content, results, _ = _run_with_mid_run_client_kill(env, [], test_time, kill_after)
 
-    env.assertNotEqual(rc, 0, message="a run whose connections were killed must not exit 0")
+    env.assertEqual(rc, 1, message="a run whose connections were killed must report an incomplete run")
     env.assertFalse("Restarting thread" in stderr_content, message="a worker thread was silently restarted")
-    env.assertTrue("unrecovered connection errors" in stderr_content, message="the failure was not reported")
+    env.assertTrue("client(s) stopped before reaching their stop condition" in stderr_content,
+                   message="the failure was not reported")
+    env.assertTrue("the results of this run are not valid" in stderr_content)
     # A restart re-runs the full window, so the run would take at least
     # kill_after + test_time. Ending on the failure takes about kill_after.
     env.assertLess(elapsed, test_time, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+    env.assertLess(results["Runtime"]["Total duration"], test_time * 1000)
 
 
 def test_connection_kill_with_reconnect_is_not_rerun(env):
@@ -692,12 +722,23 @@ def test_connection_kill_with_reconnect_is_not_rerun(env):
     """
     env.skipOnCluster()
     test_time, kill_after = 8, 2
-    rc, elapsed, stderr_content = _run_with_mid_run_client_kill(
+    rc, elapsed, stderr_content, results, server_commands = _run_with_mid_run_client_kill(
         env, ["--reconnect-on-error", "--max-reconnect-attempts=10"], test_time, kill_after
     )
 
     env.assertEqual(rc, 0)
     env.assertFalse("Restarting thread" in stderr_content, message="a worker thread was silently restarted")
+    env.assertGreaterEqual(elapsed, test_time, message="recovery ended before the requested window")
+    # JSON truncates timestamps to milliseconds; allow one millisecond of
+    # rounding while requiring the complete original measurement window.
+    env.assertGreaterEqual(results["Runtime"]["Total duration"], test_time * 1000 - 1)
+    # With pipeline=1, at most one response per client can be lost at the
+    # forced disconnect and one at final teardown. Match Redis's command
+    # count so silently dropping the pre-outage stats cannot pass.
+    reported_commands = results["Totals"]["Count"]
+    env.assertGreaterEqual(reported_commands, server_commands - 8,
+                           message="JSON discarded completed operations across recovery")
+    env.assertLessEqual(reported_commands, server_commands)
     # A re-run takes about 2 * test_time; an honest run takes test_time plus
     # process start-up and teardown.
     env.assertLess(

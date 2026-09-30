@@ -382,3 +382,74 @@ def test_json_multi_run_aggregated_sections_consistent(env):
                 debugPrintMemtierOnError(run_config, env)
     finally:
         pass
+
+
+def _assert_worker_exception_stats(env, unknown):
+    """A failed worker must retain a finalized partial window, even on exceptions."""
+    import shlex
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env.skipOnCluster()
+    compiler = shlex.split(os.environ.get("CXX", "c++"))
+    if (sys.platform != "linux" or not compiler or not shutil.which(compiler[0])
+            or not shutil.which("ldd") or not shutil.which("pkg-config")):
+        env.skip()
+        return
+    specs = {"name": env.testName, "args": ["--ratio=1:1", "--hide-histogram"]}
+    addTLSArgs(specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=3)
+    add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+    with tempfile.TemporaryDirectory() as directory:
+        config = RunConfig(directory, env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        benchmark = Benchmark.from_json(config, specs)
+        linked = subprocess.run(["ldd", benchmark.args[0]], capture_output=True, text=True, timeout=10)
+        if linked.returncode != 0 or "libevent" not in linked.stdout:
+            env.skip()  # Static executables cannot use this interposition test.
+            return
+        cflags = subprocess.run(["pkg-config", "--cflags", "libevent"], check=True,
+                                capture_output=True, text=True, timeout=10).stdout
+        library = Path(directory) / "worker_exception.so"
+        subprocess.run(compiler + ["-std=c++11", "-shared", "-fPIC"] + shlex.split(cflags)
+                       + [str(Path(__file__).with_name("worker_exception_injector.cpp")),
+                          "-o", str(library), "-ldl"],
+                       check=True, capture_output=True, timeout=30)
+        # Keep the sanitizer runtime first when interposing into instrumented builds.
+        runtimes = [line.split()[2] for line in linked.stdout.splitlines()
+                    if line.strip().startswith(("libasan.so", "libtsan.so"))
+                    and "=>" in line and len(line.split()) >= 3]
+        preloads = runtimes + [str(library)]
+        if os.environ.get("LD_PRELOAD"):
+            preloads.append(os.environ["LD_PRELOAD"])
+        child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
+        child_env.pop("MEMTIER_TEST_UNKNOWN_EXCEPTION", None)
+        if unknown:
+            child_env["MEMTIER_TEST_UNKNOWN_EXCEPTION"] = "1"
+        result = subprocess.run(benchmark.args, env=child_env, capture_output=True, text=True, timeout=15)
+        env.assertEqual(result.returncode, 1)
+        expected = "caught unknown exception" if unknown else "caught exception: injected worker exception"
+        env.assertIn(expected, result.stderr)
+        env.assertNotIn("Restarting thread", result.stderr)
+        with open(os.path.join(config.results_dir, "mb.json")) as output:
+            stats = json.load(output)["ALL STATS"]
+        runtime = stats["Runtime"]
+        env.assertGreater(runtime["Finish time"], runtime["Start time"])
+        env.assertGreater(runtime["Total duration"], 0)
+        env.assertLess(runtime["Total duration"], 3000)
+        total = stats["Totals"]["Count"]
+        env.assertGreater(total, 0)
+        env.assertEqual(stats["Sets"]["Count"] + stats["Gets"]["Count"], total)
+        for command in ("Sets", "Gets", "Totals"):
+            env.assertEqual(sum(bucket["Count"] for bucket in stats[command]["Time-Serie"].values()),
+                            stats[command]["Count"])
+
+
+def test_worker_exception_finalizes_partial_json(env):
+    _assert_worker_exception_stats(env, unknown=False)
+
+
+def test_worker_unknown_exception_finalizes_partial_json(env):
+    _assert_worker_exception_stats(env, unknown=True)
