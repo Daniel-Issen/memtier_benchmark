@@ -384,7 +384,7 @@ def test_json_multi_run_aggregated_sections_consistent(env):
         pass
 
 
-def _assert_worker_exception_stats(env, unknown):
+def _assert_worker_exception_stats(env, unknown, finalization_failure=False):
     """A failed worker must retain a finalized partial window, even on exceptions."""
     import shlex
     import shutil
@@ -400,7 +400,8 @@ def _assert_worker_exception_stats(env, unknown):
         return
     specs = {"name": env.testName, "args": ["--ratio=1:1", "--hide-histogram"]}
     addTLSArgs(specs, env)
-    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=3)
+    config = get_default_memtier_config(threads=2 if finalization_failure else 1,
+                                        clients=1, requests=None, test_time=3)
     add_required_env_arguments(specs, config, env, env.getMasterNodesList())
     with tempfile.TemporaryDirectory() as directory:
         config = RunConfig(directory, env.testName, config, {})
@@ -421,11 +422,21 @@ def _assert_worker_exception_stats(env, unknown):
         runtimes = [line.split()[2] for line in linked.stdout.splitlines()
                     if line.strip().startswith(("libasan.so", "libtsan.so"))
                     and "=>" in line and len(line.split()) >= 3]
-        preloads = runtimes + [str(library)]
+        # The fatal-path shim must own operator new, then forward to the
+        # sanitizer allocator via RTLD_NEXT. Other cases keep runtimes first.
+        preloads = ([str(library)] + runtimes if finalization_failure
+                    else runtimes + [str(library)])
         if os.environ.get("LD_PRELOAD"):
             preloads.append(os.environ["LD_PRELOAD"])
         child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
+        if finalization_failure and any("libasan" in runtime for runtime in runtimes):
+            # Only relax preload ordering for this forwarding test shim;
+            # preserve leak/error checks and every other caller option.
+            child_env["ASAN_OPTIONS"] = child_env.get("ASAN_OPTIONS", "") + ":verify_asan_link_order=0"
         child_env.pop("MEMTIER_TEST_UNKNOWN_EXCEPTION", None)
+        child_env.pop("MEMTIER_TEST_FINALIZATION_FAILURE", None)
+        if finalization_failure:
+            child_env["MEMTIER_TEST_FINALIZATION_FAILURE"] = "1"
         if unknown:
             child_env["MEMTIER_TEST_UNKNOWN_EXCEPTION"] = "1"
         result = subprocess.run(benchmark.args, env=child_env, capture_output=True, text=True, timeout=15)
@@ -433,6 +444,14 @@ def _assert_worker_exception_stats(env, unknown):
         expected = "caught unknown exception" if unknown else "caught exception: injected worker exception"
         env.assertIn(expected, result.stderr)
         env.assertNotIn("Restarting thread", result.stderr)
+        if finalization_failure:
+            env.assertIn("unable to finalize statistics; aborting benchmark", result.stderr)
+            env.assertNotIn("test-only exit cleanup ran", result.stderr)
+            # Immediate fatal termination need not flush/finish the JSON document,
+            # but must not publish unfinalized ALL STATS as a usable result.
+            with open(os.path.join(config.results_dir, "mb.json")) as output:
+                env.assertNotIn('"ALL STATS"', output.read())
+            return
         with open(os.path.join(config.results_dir, "mb.json")) as output:
             stats = json.load(output)["ALL STATS"]
         runtime = stats["Runtime"]
@@ -453,3 +472,7 @@ def test_worker_exception_finalizes_partial_json(env):
 
 def test_worker_unknown_exception_finalizes_partial_json(env):
     _assert_worker_exception_stats(env, unknown=True)
+
+
+def test_worker_finalization_failure_skips_process_cleanup(env):
+    _assert_worker_exception_stats(env, unknown=True, finalization_failure=True)

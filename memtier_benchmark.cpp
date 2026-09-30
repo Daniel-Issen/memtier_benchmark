@@ -3105,8 +3105,10 @@ static void *cg_thread_start(void *t)
         } catch (...) {
             // Finalization can allocate. If it fails too, do not merge or print
             // unfinalized statistics, and do not throw across the pthread entry.
+            // Other workers may still be using globals and TLS libraries, so
+            // terminate without running process-wide destructors/atexit handlers.
             benchmark_error_log("Thread %u: unable to finalize statistics; aborting benchmark.\n", thread->m_thread_id);
-            exit(EXIT_FAILURE);
+            _Exit(EXIT_FAILURE);
         }
     }
     cg_thread_capture_cpu_end(thread);
