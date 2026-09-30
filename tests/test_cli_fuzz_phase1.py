@@ -146,7 +146,7 @@ def _assert_worker_failed(env, args, label):
     env.assertLess(elapsed, WALL_BUDGET_SECS, message=f"[{label}] worker failure took {elapsed:.1f}s")
 
 
-def _base_args(env, **extra):
+def _base_args(env, requests=None):
     """Build the common argv prefix; subtests append scenario-specific flags."""
     if env.isUnixSocket():
         env.skip()
@@ -167,7 +167,7 @@ def _base_args(env, **extra):
         "-c", "1",
         "-t", "1",
         f"--connection-stage-timeout={SUPERVISOR_TIMEOUT_SECS}",
-        "--test-time=1",
+        "--test-time=1" if requests is None else f"--requests={requests}",
         "--hide-histogram",
     ]
     # Otherwise TLS cells only exercise a plaintext connection reset, hiding
@@ -228,7 +228,10 @@ def test_426_3_memcache_binary_against_redis(env):
 # proto-max-bulk-len so the rejection is deterministic across CI images.
 # ---------------------------------------------------------------------------
 def test_426_8_data_size_range_too_large(env):
-    args = _base_args(env)
+    # Serializing the oversized SET can exceed a one-second test window on
+    # sanitizer builds. Keep work unfinished when Redis rejects that request,
+    # even though the error reply itself counts as a completed operation.
+    args = _base_args(env, requests=100)
     if args is None:
         return
 
@@ -241,7 +244,7 @@ def test_426_8_data_size_range_too_large(env):
         # Clamp below the data-size-range upper bound so the server rejects.
         for c in master_connections:
             c.config_set("proto-max-bulk-len", 100000000)
-        args.append("--data-size-range=1-9999999999")
+        args.extend(["--pipeline=1", "--ratio=1:0", "--data-size-range=1-9999999999"])
         _assert_worker_failed(env, args, "#8 --data-size-range 1-9999999999")
     finally:
         if original_max is not None:
