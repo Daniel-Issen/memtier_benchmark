@@ -209,6 +209,9 @@ void cluster_client::txn_release_pin()
 
 void cluster_client::disconnect(void)
 {
+    // Connection IDs can be reused when the topology is rebuilt after reconnect.
+    m_mget_waiting_producers.clear();
+
     // Reset transaction pin state so a post-reconnect topology with fewer
     // shards doesn't leave m_txn_pinned_conn_id pointing past the end of
     // m_connections (which would be an out-of-bounds access).
@@ -1402,6 +1405,10 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     // Rebuild same-slot key index cache for MGET if enabled.
     build_mget_slot_cache();
 
+    // The wakeup below makes every producer retry against the new topology;
+    // none should remain tied to a retired destination.
+    m_mget_waiting_producers.clear();
+
     // Wake all connected shard connections so each one re-evaluates hold_pipeline()
     // with the freshly-built m_mget_conn_slots.  Without this, a connection that
     // was bufferevent_disable()'d before the cache existed would never re-run
@@ -2362,6 +2369,20 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         return false;
     }
 
+    if (routed != conn_id) {
+        if (m_mget_waiting_producers.size() < m_connections.size()) {
+            m_mget_waiting_producers.resize(m_connections.size());
+        }
+        // Register successful sends as well as cap deferrals: after sending
+        // the producer can park with no local I/O, while only the destination
+        // receives a response. Each producer is registered at most once per
+        // destination until a response releases it.
+        std::vector<unsigned int> &producers = m_mget_waiting_producers[routed];
+        if (std::find(producers.begin(), producers.end(), conn_id) == producers.end()) {
+            producers.push_back(conn_id);
+        }
+    }
+
     // Cross-connection backpressure: when MGET is routed to a different
     // connection than the producer (replica / nearest-mode / preferred
     // fallback), fill_pipeline's `m_pipeline->size() < pipeline` gate caps
@@ -2408,6 +2429,12 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     }
 
     m_connections[routed]->send_mget_command(&timestamp, m_keylist);
+    if (routed != conn_id) {
+        // The destination may itself be paused after its previous batch. In
+        // particular, the last request need not hit the cap-defer path above,
+        // so sending must wake its I/O even when no further work is generated.
+        m_connections[routed]->schedule_fill();
+    }
     // routed_ops is bumped by shard_connection::push_req. Record the
     // read-routing decision (Ops from Primary / Ops from Replica) here
     // because the send-side has no other context about the routing class.
@@ -2772,9 +2799,27 @@ void cluster_client::finalize_dropped_redirect(struct timeval timestamp, request
     m_stats.inc_error();
 }
 
+void cluster_client::wake_mget_producers(unsigned int conn_id)
+{
+    if (conn_id >= m_mget_waiting_producers.size()) return;
+
+    std::vector<unsigned int> &producers = m_mget_waiting_producers[conn_id];
+    for (std::vector<unsigned int>::const_iterator i = producers.begin(); i != producers.end(); ++i) {
+        if (*i < m_connections.size()) m_connections[*i]->schedule_fill();
+    }
+    producers.clear(); // Retain capacity: no allocation on steady-state wakeups.
+}
+
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {
+    // pop_req() has freed destination capacity. Wake before the error/redirect
+    // branches too, since those responses also release a pipeline slot. The
+    // coalesced callback runs after inc_reqs_processed(), never recursively
+    // inside this response handler; routing and the pipeline cap are checked
+    // again then. Reconnect/setup and topology changes have their own wakeups.
+    wake_mget_producers(conn_id);
+
     // EWMA latency update for `--read-preference=nearest`. Computed from the
     // request's most-recent send time (m_sent_time), not its first attempt;
     // retries should be reflected in the latency observed by selection.

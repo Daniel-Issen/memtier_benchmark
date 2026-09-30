@@ -19,6 +19,8 @@ test_read_preference_mget
     - cmdstat_mget on masters  == 0
 """
 
+import json
+import os
 import tempfile
 
 from include import (
@@ -124,6 +126,11 @@ def _run_mget_workload(env, extra_args, threads=2, clients=4, requests=100, time
     return ok, run_config
 
 
+def _read_stats(run_config):
+    with open(os.path.join(run_config.results_dir, "mb.json")) as output:
+        return json.load(output)["ALL STATS"]
+
+
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
@@ -161,6 +168,13 @@ def test_read_preference_mget(env):
             message="memtier exited non-zero with --multi-key-get and "
                     "--read-preference=secondary",
         )
+
+        # Routing a single batch to each replica is not completion: producers
+        # must resume when those responses free destination pipeline capacity.
+        stats = _read_stats(run_config)
+        env.assertEqual(stats["Totals"]["Count"], 100)
+        env.assertEqual(stats["Gets"]["Count"], 100)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
 
         replica_mgets = _sum_mget_calls(replica_conns)
         env.assertGreater(
@@ -233,6 +247,11 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
                     "mixed SET+MGET --read-preference=secondary; possible "
                     "spin or hang in the MGET defer path",
         )
+        stats = _read_stats(run_config)
+        env.assertEqual(stats["Totals"]["Count"], 400)
+        env.assertGreater(stats["Gets"]["Count"], 0)
+        env.assertGreater(stats["Sets"]["Count"], 0)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -248,10 +267,9 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
 # own pipeline never grows, so the only way to release the event loop is the
 # hold_pipeline yield.
 #
-# NOTE: smoke-only. Engineering a deterministic "slow replica" in a unit-test
-# Docker/RLTest environment is fragile, so we just assert the benchmark exits
-# within --test-time=5s. A timeout (hang or uncapped spin) means the spin
-# guard regressed. TODO: add a CPU-time sample if/when RLTest gains a portable
+# Check both bounded exit and the measured duration: an empty event loop after
+# one batch used to exit successfully without exercising the requested window.
+# TODO: add a CPU-time sample if/when RLTest gains a portable
 # resource-usage hook.
 # ---------------------------------------------------------------------------
 
@@ -294,6 +312,12 @@ def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
                     "possible spin or hang in the pipeline-cap defer path "
                     "(hold_pipeline yield-on-saturation regressed)",
         )
+        stats = _read_stats(run_config)
+        runtime = stats["Runtime"]
+        env.assertEqual(runtime["Time unit"], "MILLISECONDS")
+        env.assertGreaterEqual(runtime["Total duration"], 5000)
+        env.assertGreater(stats["Gets"]["Count"], 0)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
